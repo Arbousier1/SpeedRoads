@@ -1,0 +1,19 @@
+# SpeedRoads 配置 (适配 MC 1.21)
+
+settings:
+  # 检测频率 (ticks). 20 ticks = 1秒.
+  # 建议 5 (0.25秒)，配合缓存技术，几乎零负载。
+  check-interval: 5
+  
+  # 药水给予时间 (ticks). 建议 > 10 以防闪烁
+  effect-duration: 15
+
+# 路面设置
+# 格式: 大写方块ID: 速度等级 (1-255)
+# ID 参考: https://jd.papermc.io/paper/1.21/org/bukkit/Material.html
+paths:
+  # 1. 草径
+  DIRT_PATH: 1
+  # 2. 黄色混凝土
+  YELLOW_CONCRETE: 2
+  BLACK_CONCRETE: 2
