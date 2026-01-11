@@ -2,9 +2,6 @@ package top.ellan.speedroads;
 
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
-import net.minecraft.core.BlockPos;
-import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.block.state.BlockState;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -13,8 +10,6 @@ import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.configuration.ConfigurationSection;
-import org.bukkit.craftbukkit.CraftWorld;
-import org.bukkit.craftbukkit.block.CraftBlockType;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -23,6 +18,8 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -39,13 +36,45 @@ public class SpeedRoads extends JavaPlugin implements Listener {
     private long maxProcessingTimeNanos;
     private boolean skipUnloaded;
 
+    // 反射缓存
+    private Method getHandleMethod;
+    private Method getChunkIfLoadedMethod;
+    private Method getBlockStateIfLoadedMethod;
+    private Method minecraftToBukkitMethod;
+    private Constructor<?> blockPosConstructor;
+
     @Override
     public void onEnable() {
         saveDefaultConfig();
         loadSettings();
+        setupReflection();
         getServer().getPluginManager().registerEvents(this, this);
         startTask();
-        getComponentLogger().info(Component.text("SpeedRoads (Paper 1.20+ 优化版) 已启动").color(NamedTextColor.AQUA));
+        getComponentLogger().info(Component.text("SpeedRoads (Paper 兼容反射版) 已启动").color(NamedTextColor.AQUA));
+    }
+
+    private void setupReflection() {
+        try {
+            // 获取 CraftWorld -> ServerLevel
+            getHandleMethod = Class.forName("org.bukkit.craftbukkit.CraftWorld").getMethod("getHandle");
+            
+            Class<?> serverLevelClass = Class.forName("net.minecraft.server.level.ServerLevel");
+            Class<?> blockPosClass = Class.forName("net.minecraft.core.BlockPos");
+            
+            // 获取 Paper 优化方法
+            getChunkIfLoadedMethod = serverLevelClass.getMethod("getChunkIfLoadedImmediately", int.class, int.class);
+            getBlockStateIfLoadedMethod = serverLevelClass.getMethod("getBlockStateIfLoaded", blockPosClass);
+            
+            // BlockPos 构造函数
+            blockPosConstructor = blockPosClass.getConstructor(int.class, int.class, int.class);
+            
+            // NMS Block -> Bukkit Material 转换
+            minecraftToBukkitMethod = Class.forName("org.bukkit.craftbukkit.block.CraftBlockType")
+                    .getMethod("minecraftToBukkit", Class.forName("net.minecraft.world.level.block.Block"));
+            
+        } catch (Exception e) {
+            getLogger().warning("无法初始化 Paper NMS 反射，将回退至标准 API: " + e.getMessage());
+        }
     }
 
     private void loadSettings() {
@@ -83,9 +112,6 @@ public class SpeedRoads extends JavaPlugin implements Listener {
             LivingEntity target = (player.isInsideVehicle() && player.getVehicle() instanceof LivingEntity vehicle) ? vehicle : player;
             UUID worldUID = target.getWorld().getUID();
             
-            // Paper NMS 优化：直接获取 ServerLevel
-            ServerLevel nmsLevel = ((CraftWorld) target.getWorld()).getHandle();
-
             double targetSpeed = 0.0;
             int x = target.getLocation().getBlockX();
             int y = (int) Math.floor(target.getLocation().getY() + 0.1);
@@ -96,32 +122,58 @@ public class SpeedRoads extends JavaPlugin implements Listener {
             if (cache.isValid(worldUID, x, y, z)) {
                 targetSpeed = cache.speed;
             } else {
-                // Paper 优化: 零耗时加载检查
-                if (nmsLevel.getChunkIfLoadedImmediately(x >> 4, z >> 4) == null && skipUnloaded) {
-                    continue;
+                targetSpeed = getRoadSpeedWithOptimization(target, x, y, z);
+                cache.update(worldUID, x, y, z, targetSpeed);
+            }
+
+            updateAttributes(player, target, targetSpeed, cache);
+        }
+    }
+
+    private double getRoadSpeedWithOptimization(LivingEntity target, int x, int y, int z) {
+        // 反射尝试使用 Paper 优化路径
+        if (getHandleMethod != null) {
+            try {
+                Object nmsLevel = getHandleMethod.invoke(target.getWorld());
+                
+                // 1. 检查区块加载
+                if (getChunkIfLoadedMethod.invoke(nmsLevel, x >> 4, z >> 4) == null && skipUnloaded) {
+                    return 0.0;
                 }
 
                 for (int i = 0; i <= maxCheckHeight; i++) {
                     int checkY = y - i;
                     if (checkY < target.getWorld().getMinHeight()) break;
 
-                    BlockPos pos = new BlockPos(x, checkY, z);
-                    // Paper 优化: 获取已加载的 BlockState，避免包装 Block 对象
-                    BlockState nmsState = nmsLevel.getBlockStateIfLoaded(pos);
+                    Object blockPos = blockPosConstructor.newInstance(x, checkY, z);
+                    Object nmsState = getBlockStateIfLoadedMethod.invoke(nmsLevel, blockPos);
 
                     if (nmsState != null) {
-                        Material type = CraftBlockType.minecraftToBukkit(nmsState.getBlock());
+                        Object nmsBlock = nmsState.getClass().getMethod("getBlock").invoke(nmsState);
+                        Material type = (Material) minecraftToBukkitMethod.invoke(null, nmsBlock);
+                        
                         if (!type.isAir() && type != Material.WATER && type != Material.LAVA) {
-                            targetSpeed = speedMap.getOrDefault(type, 0.0);
-                            if (targetSpeed > 0) break;
+                            double s = speedMap.getOrDefault(type, 0.0);
+                            if (s > 0) return s;
                         }
                     }
                 }
-                cache.update(worldUID, x, y, z, targetSpeed);
-            }
-
-            updateAttributes(player, target, targetSpeed, cache);
+                return 0.0;
+            } catch (Exception ignored) {}
         }
+
+        // 回退逻辑：使用标准 API (如果反射不可用)
+        if (skipUnloaded && !target.getWorld().isChunkLoaded(x >> 4, z >> 4)) return 0.0;
+        for (int i = 0; i <= maxCheckHeight; i++) {
+            int checkY = y - i;
+            if (checkY < target.getWorld().getMinHeight()) break;
+            Material type = target.getWorld().getBlockAt(x, checkY, z).getType();
+            if (!type.isAir() && type != Material.WATER && type != Material.LAVA) {
+                double s = speedMap.getOrDefault(type, 0.0);
+                if (s > 0) return s;
+            }
+        }
+        return 0.0;
     }
 
     private void updateAttributes(Player player, LivingEntity target, double targetSpeed, PlayerCache cache) {
@@ -139,7 +191,7 @@ public class SpeedRoads extends JavaPlugin implements Listener {
     }
 
     private void applyAttributeSpeed(LivingEntity entity, double amount) {
-        // 关键修复: Paper 1.20+ 使用 MOVEMENT_SPEED
+        // 使用 MOVEMENT_SPEED (Paper 1.20+ API)
         AttributeInstance ai = entity.getAttribute(Attribute.MOVEMENT_SPEED);
         if (ai == null) return;
 
@@ -166,7 +218,6 @@ public class SpeedRoads extends JavaPlugin implements Listener {
     }
 
     private void clearSpeed(LivingEntity entity) {
-        // 关键修复: Paper 1.20+ 使用 MOVEMENT_SPEED
         AttributeInstance ai = entity.getAttribute(Attribute.MOVEMENT_SPEED);
         if (ai != null) ai.removeModifier(ROAD_SPEED_KEY);
     }
